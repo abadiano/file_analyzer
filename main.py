@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 import pandas as pd
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Dash and Plotly imports
 import dash
@@ -28,7 +30,7 @@ long_callback_manager = DiskcacheLongCallbackManager(cache)
 # Part 1: File Scanner
 # ------------------------------
 
-def get_file_tree(root_dir):
+def get_file_tree(root_dir, batch_size=10):
     tree = {
         'name': os.path.basename(root_dir) if os.path.basename(root_dir) else root_dir,
         'path': root_dir,
@@ -43,6 +45,7 @@ def get_file_tree(root_dir):
         try:
             print(f"Scanning: {node['path']}")
             entries = os.scandir(node['path'])
+            files_to_hash = []
             for entry in entries:
                 if entry.is_dir(follow_symlinks=False):
                     dir_node = {
@@ -54,21 +57,18 @@ def get_file_tree(root_dir):
                     add_nodes(dir_node)
                     node['children'].append(dir_node)
                 elif entry.is_file(follow_symlinks=False):
-                    file_info = get_file_info(entry.path)
-                    if file_info:
-                        print(f"File scanned: {file_info['name']}")
-                        # Check for duplicates
-                        file_hash = file_info['hash']
-                        if file_hash:
-                            if file_hash in file_hashes:
-                                file_info['is_duplicate'] = True
-                                # Mark the original file as duplicate as well
-                                original_file = file_hashes[file_hash]
-                                original_file['is_duplicate'] = True
-                                duplicate_files.append((file_info, original_file))
-                            else:
-                                file_hashes[file_hash] = file_info
-                        node['children'].append(file_info)
+                    # Collect files to hash in batches
+                    files_to_hash.append(entry.path)
+
+                    # If we have enough files in the batch, process them
+                    if len(files_to_hash) >= batch_size:
+                        process_file_batch(files_to_hash, node, file_hashes, duplicate_files)
+                        files_to_hash = []  # Reset the batch list
+
+            # Process remaining files that didn’t fill the batch
+            if files_to_hash:
+                process_file_batch(files_to_hash, node, file_hashes, duplicate_files)
+
         except PermissionError:
             print(f"Permission denied: {node['path']}")
         except Exception as e:
@@ -76,6 +76,28 @@ def get_file_tree(root_dir):
 
     add_nodes(tree)
     return tree
+
+
+def process_file_batch(filepaths, node, file_hashes, duplicate_files):
+    # Get the hashes for the batch of files
+    batch_hashes = get_file_hashes(filepaths)
+
+    # Process each file in the batch
+    for filepath, file_hash in batch_hashes.items():
+        file_info = get_file_info(filepath)
+        if file_info:
+            print(f"File scanned: {file_info['name']}")
+            # Check for duplicates
+            if file_hash:
+                if file_hash in file_hashes:
+                    file_info['is_duplicate'] = True
+                    # Mark the original file as duplicate as well
+                    original_file = file_hashes[file_hash]
+                    original_file['is_duplicate'] = True
+                    duplicate_files.append((file_info, original_file))
+                else:
+                    file_hashes[file_hash] = file_info
+            node['children'].append(file_info)
 
 
 def get_file_info(filepath):
@@ -94,12 +116,12 @@ def get_file_info(filepath):
             'creation_date': datetime.fromtimestamp(stat_info.st_ctime).isoformat(),
             'last_modified': last_modified.isoformat(),
             'extension': extension,
-            'hash': get_file_hash(filepath),
+            'hash': None,  # Hash is handled in the batch process
             'type': 'file',
             # Analysis flags
             'is_duplicate': False,
-            'is_old': (datetime.now() - last_modified).days > 5*365,
-            'is_large': size > 100*1024*1024,
+            'is_old': (datetime.now() - last_modified).days > 5 * 365,
+            'is_large': size > 100 * 1024 * 1024,
             'is_empty': is_empty
         }
         return file_info
@@ -111,19 +133,22 @@ def get_file_info(filepath):
         return None
 
 
-def get_file_hash(filepath):
-    hash_md5 = hashlib.md5()
-    try:
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-    except PermissionError:
-        print(f"Permission denied: {filepath}")
-        return None
-    except Exception as e:
-        print(f"Error hashing {filepath}: {e}")
-        return None
+def get_file_hashes(filepaths):
+    hashes = {}
+    for filepath in filepaths:
+        hash_md5 = hashlib.md5()
+        try:
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            hashes[filepath] = hash_md5.hexdigest()
+        except PermissionError:
+            print(f"Permission denied: {filepath}")
+            hashes[filepath] = None
+        except Exception as e:
+            print(f"Error hashing {filepath}: {e}")
+            hashes[filepath] = None
+    return hashes
 
 
 # ------------------------------
@@ -213,6 +238,7 @@ def build_elements(node, parent_id=None, elements=None, node_id=0):
     if 'children' in node:
         for child in node['children']:
             elements, child_id = build_elements(child, node['id'], elements, child_id)
+
     return elements, child_id
 
 
@@ -229,7 +255,8 @@ app.layout = dbc.Container([
             html.Div("Enter the root directory to scan:"),
             dcc.Input(id='directory-input', type='text', value='', style={'width': '100%'}),
             html.Button('Scan Directory', id='scan-button', n_clicks=0, style={'margin-top': '10px'}),
-            html.Div(id='loading-text', children="")
+            html.Div(id='loading-text', children=""),
+            html.Div(id='scan-stats', children="")  # New element to display scan time and file count
         ], width=12)
     ]),
     dbc.Row([
@@ -293,8 +320,11 @@ app.layout = dbc.Container([
 
 # Callback to start scanning and update the graph using Dash Long Callback
 @app.long_callback(
-    output=[Output('loading-text', 'children'),
-             Output('cytoscape', 'elements')],
+    output=[
+        Output('loading-text', 'children'),
+        Output('cytoscape', 'elements'),
+        Output('scan-stats', 'children')
+    ],
     inputs=[Input('scan-button', 'n_clicks')],
     state=[State('directory-input', 'value')],
     running=[
@@ -302,20 +332,29 @@ app.layout = dbc.Container([
         (Output('directory-input', 'disabled'), True, False),
         (Output('loading-text', 'children'), 'Scanning in progress...', '')
     ],
-    # Removed 'progress' and 'cancel' parameters as they're not used
-    # Removed 'background=True' as it's not needed and causes the error
 )
 def start_scan(n_clicks, directory):
     if n_clicks > 0 and directory:
         if not os.path.exists(directory):
-            return "Directory does not exist.", []
+            return "Directory does not exist.", [], ""
         else:
+            # Measure the scan time
+            start_time = time.time()
+
             # Perform the scanning
             file_tree = get_file_tree(directory)
-            elements, _ = build_elements(file_tree)
-            return "Scanning complete.", elements
+            elements, total_nodes = build_elements(file_tree)
+
+            # Measure the end time
+            end_time = time.time()
+            scan_time = end_time - start_time
+
+            # Prepare the scan statistics
+            stats_message = f"Scan completed in {scan_time:.2f} seconds. Total files displayed: {total_nodes}"
+
+            return "Scanning complete.", elements, stats_message
     else:
-        return "", []
+        return "", [], ""
 
 # Callback to display node data when a node is selected
 @app.callback(

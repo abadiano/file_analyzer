@@ -1,3 +1,4 @@
+# General imports
 import os
 import hashlib
 import json
@@ -10,12 +11,8 @@ import dash
 from dash import html, dcc
 import dash_bootstrap_components as dbc
 from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
 import dash_cytoscape as cyto  # For interactive graph visualization
-
-# Install dash-cytoscape and diskcache if not already installed:
-# pip install dash-cytoscape
-# pip install diskcache
-
 from dash.long_callback import DiskcacheLongCallbackManager
 import diskcache
 
@@ -86,19 +83,24 @@ def get_file_info(filepath):
         stat_info = os.stat(filepath)
         last_modified = datetime.fromtimestamp(stat_info.st_mtime)
         size = stat_info.st_size
+        filename = os.path.basename(filepath)
+        extension = os.path.splitext(filepath)[1].lower()
+        is_empty = size == 0  # Check if the file size is zero
+
         file_info = {
-            'name': os.path.basename(filepath),
+            'name': filename,
             'path': filepath,
             'size': size,
             'creation_date': datetime.fromtimestamp(stat_info.st_ctime).isoformat(),
             'last_modified': last_modified.isoformat(),
-            'extension': os.path.splitext(filepath)[1].lower(),
+            'extension': extension,
             'hash': get_file_hash(filepath),
             'type': 'file',
             # Analysis flags
             'is_duplicate': False,
-            'is_old': (datetime.now() - last_modified).days > 5 * 365,  # Older than 5 years
-            'is_large': size > 100 * 1024 * 1024  # Larger than 100 MB
+            'is_old': (datetime.now() - last_modified).days > 5*365,
+            'is_large': size > 100*1024*1024,
+            'is_empty': is_empty
         }
         return file_info
     except PermissionError:
@@ -128,18 +130,53 @@ def get_file_hash(filepath):
 # Part 2: Build Dash Application
 # ------------------------------
 
+# Legend of the App
+def create_legend():
+    legend_items = [
+        {'color': '#58a6ff', 'label': 'Directory'},
+        {'color': 'green', 'label': 'Regular File'},
+        {'color': 'red', 'label': 'Duplicate File'},
+        {'color': 'orange', 'label': 'Old File (>5 years)'},
+        {'color': 'purple', 'label': 'Large File (>100 MB)'},
+        {'color': 'grey', 'label': 'Empty File'}
+    ]
+
+    legend = html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(style={
+                        'background-color': item['color'],
+                        'width': '20px',
+                        'height': '20px',
+                        'display': 'inline-block',
+                        'margin-right': '10px',
+                        'border': '1px solid #000'
+                    }),
+                    html.Span(item['label'])
+                ],
+                style={'display': 'flex', 'align-items': 'center', 'margin-bottom': '5px'}
+            )
+            for item in legend_items
+        ],
+        style={'border': '1px solid #000', 'padding': '10px', 'margin-top': '20px'}
+    )
+    return legend
+
 # Function to convert the file tree into a format suitable for Dash Cytoscape
 def build_elements(node, parent_id=None, elements=None, node_id=0):
     if elements is None:
         elements = []
     current_id = node_id
     node['id'] = str(current_id)
-    color = '#58a6ff'  # Default color for directories
+    color = '#58a6ff'  ### Default color for directories
 
     if node['type'] == 'file':
         # Set color based on analysis flags
         if node.get('is_duplicate'):
             color = 'red'
+        elif node.get('is_empty'):
+            color = 'grey'
         elif node.get('is_old'):
             color = 'orange'
         elif node.get('is_large'):
@@ -161,6 +198,7 @@ def build_elements(node, parent_id=None, elements=None, node_id=0):
             'is_duplicate': node.get('is_duplicate', False),
             'is_old': node.get('is_old', False),
             'is_large': node.get('is_large', False),
+            'is_empty': node.get('is_empty', False),
             'background_color': color  # Pass the color to use in styling
         },
         'classes': node['type'],
@@ -202,7 +240,7 @@ app.layout = dbc.Container([
                 children=[
                     cyto.Cytoscape(
                         id='cytoscape',
-                        layout={'name': 'dagre'},  # You can change the layout
+                        layout={'name': 'dagre'},
                         style={'width': '100%', 'height': '600px'},
                         elements=[],
                         stylesheet=[
@@ -243,11 +281,15 @@ app.layout = dbc.Container([
     ]),
     dbc.Row([
         dbc.Col([
+            create_legend()
+        ], width=12)
+    ]),
+    dbc.Row([
+        dbc.Col([
             html.Div(id='node-data')
         ], width=12)
     ])
 ])
-
 
 # Callback to start scanning and update the graph using Dash Long Callback
 @app.long_callback(
@@ -274,7 +316,6 @@ def start_scan(n_clicks, directory):
             return "Scanning complete.", elements
     else:
         return "", []
-
 
 # Callback to display node data when a node is selected
 @app.callback(
@@ -309,7 +350,6 @@ def format_size(size_in_bytes):
     p = math.pow(1024, i)
     s = round(size_in_bytes / p, 2)
     return f"{s} {size_name[i]}"
-
 
 # ------------------------------
 # Run the Dash App
