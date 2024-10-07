@@ -1,11 +1,9 @@
 # General imports
 import os
 import hashlib
-import json
 from datetime import datetime
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Dash and Plotly imports
 import dash
@@ -242,9 +240,15 @@ def build_file_hierarchy(node, level=0):
     name = node['name']
     node_id = node['id']  # Use the unique ID assigned earlier
 
+    # Style for the item
+    item_style = {
+        'display': 'flex',
+        'alignItems': 'center',
+        'marginLeft': f'{20 * level}px'
+    }
+
     # Style for folder and file names
     name_style = {
-        'marginLeft': f'{20 * level}px',
         'display': 'inline-block',
         'cursor': 'pointer' if is_directory else 'default',
         'color': '#58a6ff' if is_directory else 'black'
@@ -268,7 +272,11 @@ def build_file_hierarchy(node, level=0):
     # Add icon with toggle functionality if directory
     if is_directory:
         item_children.append(
-            html.Span(icon, id={'type': 'toggle-icon', 'node_id': node_id})
+            html.Span(
+                icon,
+                id={'type': 'toggle-icon', 'node_id': node_id},
+                className='toggle-icon'
+            )
         )
     else:
         item_children.append(icon)
@@ -289,7 +297,7 @@ def build_file_hierarchy(node, level=0):
     # Create the item div
     item = html.Div(
         item_children,
-        style={'display': 'flex', 'alignItems': 'center'}
+        style=item_style
     )
 
     items.append(item)
@@ -303,6 +311,7 @@ def build_file_hierarchy(node, level=0):
         children_div = html.Div(
             child_items,
             id={'type': 'children-div', 'node_id': node_id},
+            className='children-div',
             style={'display': 'none'}  # Initially hidden
         )
         items.append(children_div)
@@ -338,6 +347,17 @@ app.layout = dbc.Container([
             html.Button('Scan Directory', id='scan-button', n_clicks=0, style={'margin-top': '10px'}),
             html.Div(id='loading-text', children=""),
             html.Div(id='scan-stats', children="")  # Element to display scan time and file count
+        ], width=12)
+    ]),
+    dbc.Row([
+        dbc.Col([
+            html.H3("File Hierarchy"),
+            html.Div([
+                dbc.Button('Expand All', id='expand-all-button', n_clicks=0, style={'margin-right': '10px'}),
+                dbc.Button('Collapse All', id='collapse-all-button', n_clicks=0),
+            ], style={'margin-bottom': '10px'}),
+            html.Div(id='file-hierarchy'),
+            html.Div(id='dummy-output', style={'display': 'none'})  # Dummy output for clientside callback
         ], width=12)
     ]),
     dbc.Row([
@@ -386,12 +406,6 @@ app.layout = dbc.Container([
                     )
                 ]
             )
-        ], width=12)
-    ]),
-    dbc.Row([
-        dbc.Col([
-            html.H3("File Hierarchy"),
-            html.Div(id='file-hierarchy'),
         ], width=12)
     ]),
     dbc.Row([
@@ -483,6 +497,34 @@ def toggle_folder(n_clicks, style):
         return style
     else:
         raise PreventUpdate
+
+# Clientside callback for "Expand All" and "Collapse All"
+app.clientside_callback(
+    """
+    function(n_clicks_expand, n_clicks_collapse) {
+        // Determine which button was clicked
+        const ctx = dash_clientside.callback_context;
+        if (!ctx.triggered.length) {
+            return window.dash_clientside.no_update;
+        }
+        const triggered_id = ctx.triggered[0]['prop_id'].split('.')[0];
+        const elements = document.getElementsByClassName('children-div');
+        if (triggered_id === 'expand-all-button') {
+            for (let i = 0; i < elements.length; i++) {
+                elements[i].style.display = 'block';
+            }
+        } else if (triggered_id === 'collapse-all-button') {
+            for (let i = 0; i < elements.length; i++) {
+                elements[i].style.display = 'none';
+            }
+        }
+        return null;
+    }
+    """,
+    Output('dummy-output', 'children'),
+    Input('expand-all-button', 'n_clicks'),
+    Input('collapse-all-button', 'n_clicks')
+)
 
 # Callback to handle visualization of specific folders
 @app.callback(

@@ -338,20 +338,20 @@ server = app.server  # Expose the server variable for deployments
 # Layout of the app
 app.layout = dbc.Container([
     dbc.Row([
-        dbc.Col(html.H1("File System Visualization with Analysis"), width=12)
+        dbc.Col(html.H1("Allianz File System Analyzer"), width=12)
     ]),
     dbc.Row([
         dbc.Col([
-            html.Div("Enter the root directory to scan:"),
+            html.Div("Enter the root directory to analyze:"),
             dcc.Input(id='directory-input', type='text', value='', style={'width': '100%'}),
-            html.Button('Scan Directory', id='scan-button', n_clicks=0, style={'margin-top': '10px'}),
+            html.Button('Initiate Directory Analysis', id='scan-button', n_clicks=0, style={'margin-top': '10px'}),
             html.Div(id='loading-text', children=""),
             html.Div(id='scan-stats', children="")  # Element to display scan time and file count
         ], width=12)
     ]),
     dbc.Row([
         dbc.Col([
-            html.H3("File Hierarchy"),
+            html.H3("Allianz Directory Overview"),
             html.Div([
                 dbc.Button('Expand All', id='expand-all-button', n_clicks=0, style={'margin-right': '10px'}),
                 dbc.Button('Collapse All', id='collapse-all-button', n_clicks=0),
@@ -362,6 +362,7 @@ app.layout = dbc.Container([
     ]),
     dbc.Row([
         dbc.Col([
+            html.H3("Directory Visualization"),
             dcc.Loading(
                 id="loading-cytoscape",
                 type="default",
@@ -433,7 +434,7 @@ app.layout = dbc.Container([
     running=[
         (Output('scan-button', 'disabled'), True, False),
         (Output('directory-input', 'disabled'), True, False),
-        (Output('loading-text', 'children'), 'Scanning in progress...', '')
+        (Output('loading-text', 'children'), 'Analysis in progress...', '')
     ],
 )
 def start_scan(n_clicks, directory):
@@ -453,9 +454,9 @@ def start_scan(n_clicks, directory):
 
             # Prepare the scan statistics
             total_files = count_files(file_tree)
-            stats_message = f"Scan completed in {scan_time:.2f} seconds. Total files displayed: {total_files}"
+            stats_message = f"Analysis completed in {scan_time:.2f} seconds. Total files displayed: {total_files}"
 
-            return "Scanning complete.", stats_message, file_tree
+            return "Analysis complete.", stats_message, file_tree
     else:
         return "", "", None
 
