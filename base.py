@@ -3,14 +3,15 @@ import os
 import hashlib
 import json
 from datetime import datetime
-import pandas as pd
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Dash and Plotly imports
 import dash
-from dash import html, dcc
+from dash import html, dcc, callback_context
 import dash_bootstrap_components as dbc
-from dash.dependencies import Input, Output, State
+from dash.dependencies import Input, Output, State, ALL, MATCH
 from dash.exceptions import PreventUpdate
 import dash_cytoscape as cyto  # For interactive graph visualization
 from dash.long_callback import DiskcacheLongCallbackManager
@@ -23,52 +24,51 @@ cyto.load_extra_layouts()
 cache = diskcache.Cache("./cache")
 long_callback_manager = DiskcacheLongCallbackManager(cache)
 
-
 # ------------------------------
 # Part 1: File Scanner
 # ------------------------------
 
-def get_file_tree(root_dir):
+def get_file_tree(root_dir, batch_size=10):
+    node_id_counter = [0]  # Use a list to make it mutable within nested functions
+
     tree = {
         'name': os.path.basename(root_dir) if os.path.basename(root_dir) else root_dir,
         'path': root_dir,
         'children': [],
-        'type': 'directory'
+        'type': 'directory',
+        'id': node_id_counter[0]  # Assign unique ID
     }
+    node_id_counter[0] += 1
 
     file_hashes = {}
     duplicate_files = []
 
     def add_nodes(node):
         try:
-            print(f"Scanning: {node['path']}")
             entries = os.scandir(node['path'])
+            files_to_hash = []
             for entry in entries:
                 if entry.is_dir(follow_symlinks=False):
                     dir_node = {
                         'name': entry.name,
                         'path': entry.path,
                         'children': [],
-                        'type': 'directory'
+                        'type': 'directory',
+                        'id': node_id_counter[0]  # Assign unique ID
                     }
+                    node_id_counter[0] += 1
                     add_nodes(dir_node)
                     node['children'].append(dir_node)
                 elif entry.is_file(follow_symlinks=False):
-                    file_info = get_file_info(entry.path)
-                    if file_info:
-                        print(f"File scanned: {file_info['name']}")
-                        # Check for duplicates
-                        file_hash = file_info['hash']
-                        if file_hash:
-                            if file_hash in file_hashes:
-                                file_info['is_duplicate'] = True
-                                # Mark the original file as duplicate as well
-                                original_file = file_hashes[file_hash]
-                                original_file['is_duplicate'] = True
-                                duplicate_files.append((file_info, original_file))
-                            else:
-                                file_hashes[file_hash] = file_info
-                        node['children'].append(file_info)
+                    files_to_hash.append(entry.path)
+
+                    if len(files_to_hash) >= batch_size:
+                        process_file_batch(files_to_hash, node, file_hashes, duplicate_files, node_id_counter)
+                        files_to_hash = []  # Reset the batch list
+
+            if files_to_hash:
+                process_file_batch(files_to_hash, node, file_hashes, duplicate_files, node_id_counter)
+
         except PermissionError:
             print(f"Permission denied: {node['path']}")
         except Exception as e:
@@ -77,15 +77,30 @@ def get_file_tree(root_dir):
     add_nodes(tree)
     return tree
 
+def process_file_batch(filepaths, node, file_hashes, duplicate_files, node_id_counter):
+    batch_hashes = get_file_hashes(filepaths)
 
-def get_file_info(filepath):
+    for filepath, file_hash in batch_hashes.items():
+        file_info = get_file_info(filepath, node_id_counter)
+        if file_info:
+            if file_hash:
+                if file_hash in file_hashes:
+                    file_info['is_duplicate'] = True
+                    original_file = file_hashes[file_hash]
+                    original_file['is_duplicate'] = True
+                    duplicate_files.append((file_info, original_file))
+                else:
+                    file_hashes[file_hash] = file_info
+            node['children'].append(file_info)
+
+def get_file_info(filepath, node_id_counter):
     try:
         stat_info = os.stat(filepath)
         last_modified = datetime.fromtimestamp(stat_info.st_mtime)
         size = stat_info.st_size
         filename = os.path.basename(filepath)
         extension = os.path.splitext(filepath)[1].lower()
-        is_empty = size == 0  # Check if the file size is zero
+        is_empty = size == 0
 
         file_info = {
             'name': filename,
@@ -94,14 +109,16 @@ def get_file_info(filepath):
             'creation_date': datetime.fromtimestamp(stat_info.st_ctime).isoformat(),
             'last_modified': last_modified.isoformat(),
             'extension': extension,
-            'hash': get_file_hash(filepath),
+            'hash': None,
             'type': 'file',
+            'id': node_id_counter[0],  # Assign unique ID
             # Analysis flags
             'is_duplicate': False,
-            'is_old': (datetime.now() - last_modified).days > 5*365,
-            'is_large': size > 100*1024*1024,
+            'is_old': (datetime.now() - last_modified).days > 5 * 365,
+            'is_large': size > 100 * 1024 * 1024,
             'is_empty': is_empty
         }
+        node_id_counter[0] += 1
         return file_info
     except PermissionError:
         print(f"Permission denied: {filepath}")
@@ -110,21 +127,22 @@ def get_file_info(filepath):
         print(f"Error accessing {filepath}: {e}")
         return None
 
-
-def get_file_hash(filepath):
-    hash_md5 = hashlib.md5()
-    try:
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
-    except PermissionError:
-        print(f"Permission denied: {filepath}")
-        return None
-    except Exception as e:
-        print(f"Error hashing {filepath}: {e}")
-        return None
-
+def get_file_hashes(filepaths):
+    hashes = {}
+    for filepath in filepaths:
+        hash_md5 = hashlib.md5()
+        try:
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            hashes[filepath] = hash_md5.hexdigest()
+        except PermissionError:
+            print(f"Permission denied: {filepath}")
+            hashes[filepath] = None
+        except Exception as e:
+            print(f"Error hashing {filepath}: {e}")
+            hashes[filepath] = None
+    return hashes
 
 # ------------------------------
 # Part 2: Build Dash Application
@@ -164,12 +182,12 @@ def create_legend():
     return legend
 
 # Function to convert the file tree into a format suitable for Dash Cytoscape
-def build_elements(node, parent_id=None, elements=None, node_id=0):
+def build_elements(node, parent_id=None, elements=None):
     if elements is None:
         elements = []
-    current_id = node_id
+    current_id = node['id']
     node['id'] = str(current_id)
-    color = '#58a6ff'  ### Default color for directories
+    color = '#58a6ff'  # Default color for directories
 
     if node['type'] == 'file':
         # Set color based on analysis flags
@@ -206,18 +224,107 @@ def build_elements(node, parent_id=None, elements=None, node_id=0):
 
     # Add the edge from parent to current node
     if parent_id is not None:
-        elements.append({'data': {'source': parent_id, 'target': node['id']}})
+        elements.append({'data': {'source': str(parent_id), 'target': node['id']}})
 
     # Recursively add children
-    child_id = current_id + 1
     if 'children' in node:
         for child in node['children']:
-            elements, child_id = build_elements(child, node['id'], elements, child_id)
-    return elements, child_id
+            elements = build_elements(child, current_id, elements)
 
+    return elements
+
+# Function to build the file hierarchy for display
+def build_file_hierarchy(node, level=0):
+    items = []
+
+    # Determine if node is a directory or file
+    is_directory = node['type'] == 'directory'
+    name = node['name']
+    node_id = node['id']  # Use the unique ID assigned earlier
+
+    # Style for folder and file names
+    name_style = {
+        'marginLeft': f'{20 * level}px',
+        'display': 'inline-block',
+        'cursor': 'pointer' if is_directory else 'default',
+        'color': '#58a6ff' if is_directory else 'black'
+    }
+
+    # Icon for expanding/collapsing
+    icon = html.Span('📁 ', style={'cursor': 'pointer'}) if is_directory else html.Span('📄 ')
+
+    # Visualize button for directories
+    visualize_button = dbc.Button(
+        'Visualize',
+        id={'type': 'visualize-button', 'node_id': node_id},
+        size='sm',
+        color='secondary',
+        style={'marginLeft': '10px'}
+    ) if is_directory else None
+
+    # Main item (folder or file)
+    item_children = []
+
+    # Add icon with toggle functionality if directory
+    if is_directory:
+        item_children.append(
+            html.Span(icon, id={'type': 'toggle-icon', 'node_id': node_id})
+        )
+    else:
+        item_children.append(icon)
+
+    # Add name
+    item_children.append(
+        html.Span(
+            name,
+            style=name_style,
+            id={'type': 'item-name', 'node_id': node_id}
+        )
+    )
+
+    # Add visualize button if directory
+    if visualize_button:
+        item_children.append(visualize_button)
+
+    # Create the item div
+    item = html.Div(
+        item_children,
+        style={'display': 'flex', 'alignItems': 'center'}
+    )
+
+    items.append(item)
+
+    # If the node is a directory, recursively build its children (initially hidden)
+    if is_directory:
+        child_items = []
+        for child in node.get('children', []):
+            child_items.extend(build_file_hierarchy(child, level + 1))  # Flatten the list
+
+        children_div = html.Div(
+            child_items,
+            id={'type': 'children-div', 'node_id': node_id},
+            style={'display': 'none'}  # Initially hidden
+        )
+        items.append(children_div)
+
+    return items
+
+# Function to format file sizes
+def format_size(size_in_bytes):
+    if size_in_bytes == '' or size_in_bytes is None:
+        return ''
+    size_in_bytes = int(size_in_bytes)
+    if size_in_bytes == 0:
+        return '0 B'
+    size_name = ('B', 'KB', 'MB', 'GB', 'TB')
+    i = int(math.floor(math.log(size_in_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_in_bytes / p, 2)
+    return f"{s} {size_name[i]}"
 
 # Initialize Dash app
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], long_callback_manager=long_callback_manager)
+server = app.server  # Expose the server variable for deployments
 
 # Layout of the app
 app.layout = dbc.Container([
@@ -229,7 +336,8 @@ app.layout = dbc.Container([
             html.Div("Enter the root directory to scan:"),
             dcc.Input(id='directory-input', type='text', value='', style={'width': '100%'}),
             html.Button('Scan Directory', id='scan-button', n_clicks=0, style={'margin-top': '10px'}),
-            html.Div(id='loading-text', children="")
+            html.Div(id='loading-text', children=""),
+            html.Div(id='scan-stats', children="")  # Element to display scan time and file count
         ], width=12)
     ]),
     dbc.Row([
@@ -238,11 +346,12 @@ app.layout = dbc.Container([
                 id="loading-cytoscape",
                 type="default",
                 children=[
+                    # Include the cytoscape component in the initial layout
                     cyto.Cytoscape(
                         id='cytoscape',
                         layout={'name': 'dagre'},
                         style={'width': '100%', 'height': '600px'},
-                        elements=[],
+                        elements=[],  # Start with empty elements
                         stylesheet=[
                             {
                                 'selector': 'node',
@@ -281,6 +390,12 @@ app.layout = dbc.Container([
     ]),
     dbc.Row([
         dbc.Col([
+            html.H3("File Hierarchy"),
+            html.Div(id='file-hierarchy'),
+        ], width=12)
+    ]),
+    dbc.Row([
+        dbc.Col([
             create_legend()
         ], width=12)
     ]),
@@ -288,13 +403,17 @@ app.layout = dbc.Container([
         dbc.Col([
             html.Div(id='node-data')
         ], width=12)
-    ])
+    ]),
+    dcc.Store(id='file-tree-store')  # Store the file tree data
 ])
 
 # Callback to start scanning and update the graph using Dash Long Callback
 @app.long_callback(
-    output=[Output('loading-text', 'children'),
-             Output('cytoscape', 'elements')],
+    output=[
+        Output('loading-text', 'children'),
+        Output('scan-stats', 'children'),
+        Output('file-tree-store', 'data')
+    ],
     inputs=[Input('scan-button', 'n_clicks')],
     state=[State('directory-input', 'value')],
     running=[
@@ -302,20 +421,103 @@ app.layout = dbc.Container([
         (Output('directory-input', 'disabled'), True, False),
         (Output('loading-text', 'children'), 'Scanning in progress...', '')
     ],
-    # Removed 'progress' and 'cancel' parameters as they're not used
-    # Removed 'background=True' as it's not needed and causes the error
 )
 def start_scan(n_clicks, directory):
     if n_clicks > 0 and directory:
         if not os.path.exists(directory):
-            return "Directory does not exist.", []
+            return "Directory does not exist.", "", None
         else:
+            # Measure the scan time
+            start_time = time.time()
+
             # Perform the scanning
             file_tree = get_file_tree(directory)
-            elements, _ = build_elements(file_tree)
-            return "Scanning complete.", elements
+
+            # Measure the end time
+            end_time = time.time()
+            scan_time = end_time - start_time
+
+            # Prepare the scan statistics
+            total_files = count_files(file_tree)
+            stats_message = f"Scan completed in {scan_time:.2f} seconds. Total files displayed: {total_files}"
+
+            return "Scanning complete.", stats_message, file_tree
     else:
-        return "", []
+        return "", "", None
+
+# Function to count total files
+def count_files(node):
+    count = 0
+    if node['type'] == 'file':
+        return 1
+    elif node['type'] == 'directory':
+        for child in node.get('children', []):
+            count += count_files(child)
+    return count
+
+# Callback to build the file hierarchy after scanning
+@app.callback(
+    Output('file-hierarchy', 'children'),
+    Input('file-tree-store', 'data')
+)
+def update_file_hierarchy(file_tree):
+    if file_tree:
+        hierarchy = build_file_hierarchy(file_tree)
+        return hierarchy
+    else:
+        return ""
+
+# Callback to handle expanding/collapsing folders
+@app.callback(
+    Output({'type': 'children-div', 'node_id': MATCH}, 'style'),
+    Input({'type': 'toggle-icon', 'node_id': MATCH}, 'n_clicks'),
+    State({'type': 'children-div', 'node_id': MATCH}, 'style'),
+    prevent_initial_call=True
+)
+def toggle_folder(n_clicks, style):
+    if n_clicks:
+        if style and style.get('display') == 'none':
+            style['display'] = 'block'
+        else:
+            style['display'] = 'none'
+        return style
+    else:
+        raise PreventUpdate
+
+# Callback to handle visualization of specific folders
+@app.callback(
+    Output('cytoscape', 'elements'),
+    Input({'type': 'visualize-button', 'node_id': ALL}, 'n_clicks'),
+    State('file-tree-store', 'data'),
+    prevent_initial_call=True
+)
+def visualize_folder(n_clicks_list, file_tree):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    else:
+        # Get the triggered ID directly as a dictionary
+        button_id = ctx.triggered_id
+        node_id = button_id['node_id']
+
+        # Find the node corresponding to the node_id
+        folder_node = find_node_by_id(file_tree, node_id)
+        if folder_node:
+            elements = build_elements(folder_node)
+            return elements  # Return the elements to update the cytoscape graph
+        else:
+            return []
+
+# Helper function to find a node by ID
+def find_node_by_id(node, node_id):
+    if node['id'] == node_id:
+        return node
+    elif node['type'] == 'directory':
+        for child in node.get('children', []):
+            result = find_node_by_id(child, node_id)
+            if result:
+                return result
+    return None
 
 # Callback to display node data when a node is selected
 @app.callback(
@@ -337,19 +539,6 @@ def display_node_data(data):
         return info
     else:
         return "Click on a node to see details."
-
-
-def format_size(size_in_bytes):
-    if size_in_bytes == '' or size_in_bytes is None:
-        return ''
-    size_in_bytes = int(size_in_bytes)
-    if size_in_bytes == 0:
-        return '0 B'
-    size_name = ('B', 'KB', 'MB', 'GB', 'TB')
-    i = int(math.floor(math.log(size_in_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_in_bytes / p, 2)
-    return f"{s} {size_name[i]}"
 
 # ------------------------------
 # Run the Dash App
