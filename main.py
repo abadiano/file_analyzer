@@ -15,7 +15,7 @@ import dash_cytoscape as cyto  # For interactive graph visualization
 from dash.long_callback import DiskcacheLongCallbackManager
 import diskcache
 
-# Load extra layouts for cytoscape
+# Load extra layouts for Cytoscape
 cyto.load_extra_layouts()
 
 # Initialize diskcache for background callbacks
@@ -268,8 +268,20 @@ def build_file_hierarchy(node, level=0):
         style={'marginLeft': '10px'}
     ) if is_directory else None
 
+    # Checkbox for selection
+    checkbox = dcc.Checklist(
+        options=[{'label': '', 'value': node_id}],
+        value=[],
+        id={'type': 'checkbox', 'node_id': node_id},
+        inputStyle={'margin-right': '5px'},
+        style={'margin-right': '10px'}
+    )
+
     # Main item (folder or file)
     item_children = []
+
+    # Add checkbox
+    item_children.append(checkbox)
 
     # Add icon with toggle functionality if directory
     if is_directory:
@@ -345,6 +357,7 @@ app.layout = dbc.Container([
     dcc.Store(id='selected-section', data='Analysis'),  # Store to track selected section
     dcc.Store(id='file-tree-store'),  # Store the file tree data
     dcc.Store(id='all-files-store'),  # Store all files data for analysis
+    dcc.Store(id='selected-items-store', data=[]),  # Store selected items from checkboxes
     dbc.Row([
         dbc.Col(html.H1("Allianz File System Analyzer"), width=12)
     ]),
@@ -439,20 +452,26 @@ def show_post_analysis_content(analysis_complete):
         Input('analysis-button', 'n_clicks'),
         Input('directory-overview-button', 'n_clicks'),
         Input('builder-button', 'n_clicks'),
-        Input('analysis-complete', 'data')
+        Input('analysis-complete', 'data')  # Add this back as an Input
     ],
-    State('file-tree-store', 'data'),
-    State('all-files-store', 'data'),
-    prevent_initial_call=True
+    [
+        State('analysis-complete', 'data'),
+        State('file-tree-store', 'data'),
+        State('all-files-store', 'data'),
+        State('selected-items-store', 'data')
+    ],
+    prevent_initial_call=False  # Allow initial call to set default content
 )
-def update_section_content(n_clicks_analysis, n_clicks_overview, n_clicks_builder, analysis_complete, file_tree, all_files):
-    if not analysis_complete:
+def update_section_content(n_clicks_analysis, n_clicks_overview, n_clicks_builder, analysis_complete_input,
+                           analysis_complete_state, file_tree, all_files, selected_items):
+    if not analysis_complete_state:
         raise PreventUpdate
 
+    # Determine which input triggered the callback
     ctx = dash.callback_context
     if not ctx.triggered:
+        # Default to 'Analysis' tab when the app loads
         selected_section = 'Analysis'
-        triggered_id = 'analysis-button'
     else:
         triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
         if triggered_id == 'analysis-button':
@@ -461,8 +480,10 @@ def update_section_content(n_clicks_analysis, n_clicks_overview, n_clicks_builde
             selected_section = 'Directory Overview'
         elif triggered_id == 'builder-button':
             selected_section = 'Builder'
-        else:
+        elif triggered_id == 'analysis-complete' and analysis_complete_input:
             selected_section = 'Analysis'
+        else:
+            raise PreventUpdate  # Ignore other triggers
 
     # Update the section content
     if selected_section == 'Analysis':
@@ -474,6 +495,8 @@ def update_section_content(n_clicks_analysis, n_clicks_overview, n_clicks_builde
             html.Div([
                 dbc.Button('Expand All', id='expand-all-button', n_clicks=0, style={'margin-right': '10px'}),
                 dbc.Button('Collapse All', id='collapse-all-button', n_clicks=0),
+                # Add Copy Selected to Builder button
+                dbc.Button('Copy Selected to Builder', id='copy-to-builder-button', n_clicks=0, style={'margin-left': '30px'}),
             ], style={'margin-bottom': '10px'}),
             html.Div(id='file-hierarchy'),
             html.Div(id='visualization-content'),  # Placeholder for visualization
@@ -482,12 +505,9 @@ def update_section_content(n_clicks_analysis, n_clicks_overview, n_clicks_builde
         # Update file hierarchy
         if file_tree:
             hierarchy = build_file_hierarchy(file_tree)
-            content.children[2].children = hierarchy  # file-hierarchy is at index 2
+            content.children[2].children = hierarchy  # Corrected index to 2
     elif selected_section == 'Builder':
-        content = html.Div([
-            html.H3("Builder"),
-            html.P("Work in progress")
-        ])
+        content = build_builder_content(selected_items)
     else:
         content = html.Div()
 
@@ -590,6 +610,24 @@ def build_file_table(files):
 
     return table
 
+def build_builder_content(selected_items):
+    if not selected_items:
+        return html.Div([
+            html.H3("Builder"),
+            html.P("No items have been copied from the Directory Overview yet.")
+        ])
+    else:
+        # Display the list of copied items
+        items = []
+        for item in selected_items:
+            items.append(html.Li(f"{item['type'].capitalize()}: {item['path']}"))
+        content = html.Div([
+            html.H3("Builder"),
+            html.P("List of copied items:"),
+            html.Ul(items)
+        ])
+        return content
+
 # Callback to toggle collapsibles in Analysis tab
 @app.callback(
     [Output(f"collapse-{metric_id}", "is_open") for metric_id in ['total-files', 'duplicate-files', 'old-files', 'large-files', 'empty-files']],
@@ -686,6 +724,36 @@ app.clientside_callback(
     Input('expand-all-button', 'n_clicks'),
     Input('collapse-all-button', 'n_clicks')
 )
+
+# Callback to collect selected items from checkboxes
+@app.callback(
+    Output('selected-items-store', 'data'),
+    Input('copy-to-builder-button', 'n_clicks'),
+    State({'type': 'checkbox', 'node_id': ALL}, 'value'),
+    State({'type': 'checkbox', 'node_id': ALL}, 'id'),
+    State('file-tree-store', 'data'),
+    prevent_initial_call=True
+)
+def copy_selected_to_builder(n_clicks, checkbox_values_list, checkbox_ids_list, file_tree):
+    if n_clicks:
+        selected_node_ids = []
+        for value_list in checkbox_values_list:
+            if value_list:
+                selected_node_ids.extend(value_list)
+
+        selected_items = []
+        for node_id in selected_node_ids:
+            node = find_node_by_id(file_tree, int(node_id))
+            if node:
+                selected_items.append({
+                    'id': node['id'],
+                    'name': node['name'],
+                    'path': node['path'],
+                    'type': node['type']
+                })
+        return selected_items
+    else:
+        raise PreventUpdate
 
 # Callback to handle visualization of specific folders
 @app.callback(
